@@ -10,6 +10,7 @@ import Graphics.UI.SDL.Color as SDL.Color
 import qualified System.Exit
 import qualified System.Random
 import Data.Bits (shift)
+import Control.Monad.State
 import qualified Raytracer
 
 screenWidth :: Int
@@ -34,18 +35,19 @@ pixelFromColor (Raytracer.Color r g b) =
         (truncate (255*b))
     )
 
-raytraceAndRender :: Surface -> [Raytracer.Color] -> (Float, Float) -> IO [Raytracer.Color]
-raytraceAndRender surface photonBuffer subPix =
+raytraceAndRender :: Surface -> [Raytracer.Color] -> [Float] -> IO ([Float], [Raytracer.Color])
+raytraceAndRender surface photonBuffer randFloats =
     do
         renderPixels 0 0 photonBuffer' $ \(Raytracer.Color r g b) ->
-                                           Raytracer.Color (brightness*r) (brightness*g) (brightness*b)
-        return photonBuffer'
+                                           Raytracer.Color (brightness*(log (1.0+r))) (brightness*(log (1.0+g))) (brightness*(log (1.0+b)))
+        return (randFloats', photonBuffer')
     where
         -- subPix jiggle the scene eye rays by fractions of a pixel in order to
         -- perform multi-pass stochastic anti-aliasing
-        photonBuffer' = zipWith (+) photonBuffer (Raytracer.renderScene screenWidth screenHeight subPix)
+        (photons, randFloats') = runState (Raytracer.pathTraceScene screenWidth screenHeight) randFloats
+        photonBuffer' = zipWith (+) photonBuffer photons
         maxColor = (Raytracer.maxColor . maximum) photonBuffer'
-        brightness = 1.0 / maxColor
+        brightness = 1.0 / (log (1.0+maxColor))
 
         renderPixels :: Int -> Int -> [Raytracer.Color] -> (Raytracer.Color -> Raytracer.Color) -> IO ()
         renderPixels x y colbuf postProcFn
@@ -58,13 +60,13 @@ raytraceAndRender surface photonBuffer subPix =
             SDL.Video.fillRect surface (Just $ SDL.Rect.Rect x y 1 1) $ (pixelFromColor . postProcFn) col
 
 mainLoop :: [Float] -> [Raytracer.Color] -> Surface -> IO ()
-mainLoop (subPixX:subPixY:randFloats) photonBuffer screen =
+mainLoop randFloats photonBuffer screen =
     do
         eventLoop
-        photonBuffer' <- raytraceAndRender screen photonBuffer (subPixX, subPixY)
+        (randFloats', photonBuffer') <- raytraceAndRender screen photonBuffer randFloats
         SDL.Video.flip screen
         SDL.Time.delay 100
-        mainLoop randFloats photonBuffer' screen
+        mainLoop randFloats' photonBuffer' screen
 
 main :: IO ()
 main = do

@@ -1,12 +1,25 @@
 module Raytracer where
+import qualified Data.List
+import qualified Data.Maybe
+import Control.Monad.State
 import Vector
+import Debug.Trace
 --module Raytracer (Color(..), renderScene) where
 
 epsilon :: Float
-epsilon = 0.0000001
+epsilon = 0.0001
 
-newtype RayIntersection = IsectAt Float deriving (Show, Eq, Ord)
+data Ray = Ray {
+    ray_origin :: Vector,
+    ray_dir :: Vector
+} deriving (Show)
+
 data Color = Color { red :: Float, green :: Float, blue :: Float } deriving (Show, Eq)
+
+scaleColor :: Float -> Color -> Color
+scaleColor f (Color r g b) = Color (f*r) (f*g) (f*b)
+
+
 instance Num Color where
     (Color r1 g1 b1) + (Color r2 g2 b2) = Color (r1+r2) (g1+g2) (b1+b2)
     (Color r1 g1 b1) - (Color r2 g2 b2) = Color (r1-r2) (g1-g2) (b1-b2)
@@ -14,23 +27,130 @@ instance Num Color where
     abs _ = error "abs Color: undefined"
     signum _ = error "abs Color: undefined"
     fromInteger _ = error "fromInteger Color: undefined"
+
+
 instance Ord Color where
     (Color r1 g1 b1) <= (Color r2 g2 b2) = maximum [r1, g1, b1] <= maximum [r2, g2, b2]
+
+data Primitive = Sphere Vector Float | Triangle Vector Vector Vector deriving (Show, Eq);
+data Material = Material { emissive :: Color, diffuse :: Color } deriving (Show);
+newtype SceneObj = SceneObj (Primitive, Material) deriving (Show);
+newtype RayIntersection = IsectAt (Float, SceneObj, Ray) deriving (Show)
+
+scene :: [SceneObj]
+scene = [
+        -- balls in scene
+        SceneObj (Sphere (Vector 0 (-1.5) (-4)) 1.0,
+                  Material {emissive=Color 0.0 0.0 0.0, diffuse=Color 1.0 1.0 1.0}),
+
+        SceneObj (Sphere (Vector 2 (-1) (-4)) 0.5,
+                  Material {emissive=Color 0.0 1.0 0.0, diffuse=Color 1.0 1.0 1.0}),
+        SceneObj (Sphere (Vector (-2) (-1) (-4)) 0.5,
+                  Material {emissive=Color 1.0 0.0 0.0, diffuse=Color 1.0 1.0 1.0}),
+        SceneObj (Sphere (Vector 0 0 (-4)) 0.5,
+                  Material {emissive=Color 0.0 0.0 1.0, diffuse=Color 1.0 1.0 1.0}),
+        -- floor
+        SceneObj (Triangle (Vector (-100) (-2) 0)
+                           (Vector (-100) (-2) (-100))
+                           (Vector 100 (-2) 0),
+                  Material {emissive=Color 0 0 0, diffuse=Color 1.0 1.0 1.0}),
+        SceneObj (Triangle (Vector 100 (-2) 0)
+                           (Vector (-100) (-2) (-100))
+                           (Vector (100) (-2) (-100)),
+                  Material {emissive=Color 0 0 0, diffuse=Color 1.0 1.0 1.0}),
+        -- back wall
+        SceneObj (Triangle (Vector (-100) (-2) (-10))
+                           (Vector 100 100 (-10))
+                           (Vector 100 (-2) (-10)),
+                  Material {emissive=Color 0 0 0, diffuse=Color 1.0 1.0 1.0}),
+        SceneObj (Triangle (Vector 100 100 (-10))
+                           (Vector (-100) 100 (-10))
+                           (Vector (-100) (-2) (-10)),
+                  Material {emissive=Color 0 0 0, diffuse=Color 1.0 1.0 1.0}),
+        -- light
+        SceneObj (Sphere (Vector 0 8 (-4)) 3.0,
+                  Material {emissive=Color 1.0 1.0 0.8, diffuse=Color 1.0 1.0 1.0})
+    ]
+
+isectNormal :: RayIntersection -> Vector
+isectNormal isect@(IsectAt(_, (SceneObj ((Sphere sphere_origin _), _)), _)) =
+    normalize $ (isectPos isect) - sphere_origin
+
+isectNormal (IsectAt (_, SceneObj (Triangle v1 v2 v3, _), _))  =
+    normalize $ (v2-v1) `cross` (v2-v3)
+
+isectPos :: RayIntersection -> Vector
+isectPos (IsectAt (dist, _, Ray origin dir)) = origin + (dist `fmul` dir)
+
+flipVectorToHemisphere :: Vector -> Vector -> Vector
+flipVectorToHemisphere vec@(Vector x y z) norm =
+    if vec `dot` norm > 0.0 then
+        vec
+    else
+        Vector (-x) (-y) (-z)
+
+{- ray bounces left, entropy pool, past intersections -}
+type PathState = (Int, [Float], [RayIntersection])
+
+randomVectorInHemisphere :: Vector -> State PathState Vector
+randomVectorInHemisphere norm =
+    do
+        (bounces, randFloats, rayIsects) <- get
+        put (bounces, drop 3 randFloats, rayIsects)
+        return $ normalize $ flipVectorToHemisphere (
+            Vector (0.5 - randFloats!!0) (0.5 - randFloats!!1) (0.5 - randFloats!!2)) norm
+
+
+{- Make a random ray from the last ray intersection in PathState -}
+newRandomRayFromLastIntersection :: State PathState Ray
+newRandomRayFromLastIntersection =
+    do
+        (_, _, rayIsects) <- get
+        let lastIsectNormal = isectNormal $ head rayIsects
+        let rayStartPos = (isectPos $ head rayIsects) + (epsilon `fmul` lastIsectNormal)
+        randDir <- randomVectorInHemisphere lastIsectNormal
+        {-put (randFloats, rayIsects)-}
+        return $ Ray rayStartPos randDir
+
+
+{- Take an initial ray, trace it through scene, add its intersection data
+   to PathState, and (if intersected) fire off new ray from intersected point
+   until we've exhausted number of 'bounces' of PathState -}
+makeRayScatterPath :: Ray -> [SceneObj] -> State PathState ()
+makeRayScatterPath ray sceneobjs =
+    case isect of Nothing -> return ()
+                  Just isect' -> do
+                      (bounces, randFloats, rayIsects) <- get
+                      put (bounces-1, randFloats, isect':rayIsects)
+                      nextRay sceneobjs (bounces-1)
+    where
+        isect = findFirstIntersection ray sceneobjs
+
+        nextRay :: [SceneObj] -> Int -> State PathState ()
+        nextRay sceneobjs' bounces
+            | bounces > 0 = do
+                            ray' <- newRandomRayFromLastIntersection
+                            makeRayScatterPath ray' sceneobjs'
+            | otherwise = return ()
+
+        findFirstIntersection :: Ray -> [SceneObj] -> Maybe RayIntersection
+        findFirstIntersection ray objs =
+                findFirst $ Data.Maybe.catMaybes $ map (rayPrimitiveIntersects ray) objs
+            where
+                findFirst :: [RayIntersection] -> Maybe RayIntersection
+                findFirst [] = Nothing
+                findFirst xs = Just $ Data.List.minimumBy isCloser xs
+
+                isCloser :: RayIntersection -> RayIntersection -> Ordering
+                isCloser (IsectAt (d1, _, _)) (IsectAt (d2, _, _)) =
+                    if d1 < d2 then LT else GT
+
 
 maxColor :: Color -> Float
 maxColor (Color r g b) = maximum [r, g, b]
 
-
-data Primitive = Sphere Vector Float | Triangle Vector Vector Vector deriving (Show, Eq);
-
-data Ray = Ray {
-    ray_origin :: Vector,
-    ray_dir :: Vector
-} deriving (Show)
-
-
-rayPrimitiveIntersects :: Ray -> Primitive -> Maybe RayIntersection
-rayPrimitiveIntersects (Ray origin dir) (Sphere sphere_origin sphere_radius) =
+rayPrimitiveIntersects :: Ray -> SceneObj -> Maybe RayIntersection
+rayPrimitiveIntersects ray@(Ray origin dir) obj@(SceneObj ((Sphere sphere_origin sphere_radius), _)) =
     let
         v = (origin - sphere_origin)
         b = -(v `dot` dir)
@@ -42,13 +162,13 @@ rayPrimitiveIntersects (Ray origin dir) (Sphere sphere_origin sphere_radius) =
                 i2 = b + det
             in
                 if i2 > 0 then
-                    if i1 < 0 then Just $ IsectAt i2
-                    else Just $ IsectAt i1
+                    if i1 < 0 then Just $ IsectAt (i2, obj, ray)
+                    else Just $ IsectAt (i1, obj, ray)
                 else
                     Nothing
         else
             Nothing
-rayPrimitiveIntersects (Ray origin dir) (Triangle a b c) =
+rayPrimitiveIntersects ray@(Ray origin dir) obj@(SceneObj ((Triangle a b c), _)) =
     let
         n = (c - a) `cross` (b - a)
         v0_cross = (b - origin) `cross` (a - origin)
@@ -69,18 +189,11 @@ rayPrimitiveIntersects (Ray origin dir) (Triangle a b c) =
                     vol = 1.0/(v0d+v1d+v2d)
                     v = v1d*vol 
                     u = v2d*vol -}
-                    Just $ IsectAt dist
+                    Just $ IsectAt (dist, obj, ray)
                 else
                     Nothing
         else
             Nothing
-
-findFirstIntersection :: Ray -> [Primitive] -> Maybe RayIntersection
-findFirstIntersection ray primitives =
-    findFirst $ filter (/= Nothing) $ map (rayPrimitiveIntersects ray) primitives
-    where
-    findFirst [] = Nothing
-    findFirst xs = minimum xs
 
 -- Generate a 'pyramid' of eye rays from camera location toward the scene
 -- Rays are returned in row-major order
@@ -98,23 +211,33 @@ eyeRays width height (subPixX, subPixY) =
         downStep = (1.0 / (fh-1)) `fmul` Vector 0 (-2) 0
         topLeft = topLeft' + subPixX `fmul` rightStep + subPixY `fmul` downStep
 
-renderScene :: Int -> Int -> (Float, Float) -> [Color]
-renderScene screenWidth screenHeight subPix =
+collectLightFromPath :: [RayIntersection] -> Color -> Color
+collectLightFromPath [] color = color
+collectLightFromPath (isect:isects) color =
+    collectLightFromPath isects $ (emissive material) + reflected
+    where
+        surface_normal = isectNormal isect
+        (IsectAt (_, sceneobj, ray)) = isect
+        (SceneObj (_, material)) = sceneobj
+
+        cos_theta = -(normalize $ ray_dir ray) `dot` surface_normal
+        reflected = cos_theta `scaleColor` (color * (diffuse material))
+
+pathTraceScene :: Int -> Int -> State [Float] [Color]
+pathTraceScene screenWidth screenHeight = do
     -- subPixX,Y jiggle the scene eye rays by fractions of a pixel in order to
     -- perform (multi-pass) anti-aliasing
-    map rayColor [ findFirstIntersection ray primitives | ray <- eyeRays screenWidth screenHeight subPix ]
+    randFloats <- get
+    let (subpixX:subpixY:_) = randFloats
+    put $ drop 2 randFloats
+    pathTraceRays (eyeRays screenWidth screenHeight (subpixX, subpixY))
     where
-        primitives = [
-            Sphere (Vector 0 0 (-4)) 1.5,
-            Sphere (Vector 2 0 (-4)) 1.5,
-            Sphere (Vector 0 4 (-8)) 1.5,
-            Triangle (Vector 0 0 (-4))
-                     (Vector (-1) 1 (-2))
-                     (Vector 0 1 (-4)),
-            Triangle (Vector 0 0 (-4))
-                     (Vector (-0.101) (-3) (-4))
-                     (Vector (-0.1) (-3) (-4))]
-
-        rayColor :: Maybe RayIntersection -> Color
-        rayColor Nothing = Color 0 0 0
-        rayColor (Just (IsectAt dist)) = Color (1.0/dist) (1.0/dist) (1.0/dist)
+        pathTraceRays :: [Ray] -> State [Float] [Color]
+        pathTraceRays [] = return []
+        pathTraceRays (ray:rays) = do
+            randFloats' <- get
+            let (_, (_, randFloats'', isects)) = runState (makeRayScatterPath ray scene)
+                                                          (4, randFloats', [])
+            put randFloats''
+            rest <- pathTraceRays rays
+            return $ (collectLightFromPath isects (Color 0 0 0)):rest
