@@ -1,6 +1,6 @@
 module Vector where
 
-data Vector = Vector Float Float Float deriving (Show, Eq, Ord)
+data Vector = Vector !Float !Float !Float deriving (Show, Eq, Ord)
 
 instance Num Vector where
     (Vector ax ay az) + (Vector bx by bz) = Vector (ax + bx) (ay + by) (az + bz)
